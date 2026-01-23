@@ -51,4 +51,4 @@ def create_incident(short_description: str, urgency: int, category: str = "Hardw
 
 # Lancement
 if __name__ == "__main__":
-    mcp.run(transport='sse')
+    mcp.run(transport='sse', host='0.0.0.0', port=8000)
