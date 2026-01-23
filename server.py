@@ -3,7 +3,7 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 # Initialisation du serveur
-mcp = FastMCP("ServiceNow Agent")
+mcp = FastMCP("ServiceNow Agent", host="0.0.0.0", port=8000)
 
 # Récupération des variables (on les définira dans le terminal juste après)
 SN_INSTANCE = os.getenv("SN_INSTANCE")
@@ -51,4 +51,4 @@ def create_incident(short_description: str, urgency: int, category: str = "Hardw
 
 # Lancement
 if __name__ == "__main__":
-    mcp.run(transport='sse', host='0.0.0.0', port=8000)
+    mcp.run(transport='sse')
