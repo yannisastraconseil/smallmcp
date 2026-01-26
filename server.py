@@ -1535,92 +1535,91 @@ def list_catalog_items(
 
 @mcp.tool()
 def get_catalog_item(item_id: str) -> str:
-    """Get details of a specific catalog item including the variable schema for ordering.
+    """Get details of a specific catalog item including variable schema AND CHOICES.
 
     This tool provides the information needed to call submit_catalog_request.
-    The 'variables_schema' in the response shows which keys to use in the
-    'variables' JSON parameter when ordering.
+    It fetches both the questions (variables) and their valid options (choices).
 
     Args:
         item_id: Catalog item sys_id (32-character hexadecimal)
 
     Returns:
-        JSON string with catalog item details and variable schema for ordering.
-        The 'variables_schema' array shows:
-        - name: The technical key to use in submit_catalog_request variables
-        - label: Human-readable description of the field
-        - type: Data type (string, integer, reference, etc.)
-        - mandatory: Whether the field is required (true/false)
-        - help_text: Additional guidance for the field
+        JSON string with catalog item details, variable schema, and valid choices.
     """
     logger.info(f"Getting catalog item: {item_id}")
 
-    # Validate item_id format
+    # 1. Validation de l'ID
     valid, error = validate_sys_id(item_id)
     if not valid:
-        logger.warning(f"Invalid item_id format: {error}")
-        return json.dumps({
-            "success": False,
-            "message": error,
-            "data": None
-        })
+        return json.dumps({"success": False, "message": error, "data": None})
 
-    # Get item details with minimal fields
+    # 2. Récupération de l'article (Item)
     params = {
         "sysparm_fields": CATALOG_DETAIL_FIELDS,
         "sysparm_display_value": "true",
         "sysparm_exclude_reference_link": "true"
     }
-
     result = make_request("GET", f"table/sc_cat_item/{item_id}", params=params)
-
+    
     if "error" in result:
-        logger.error(f"Failed to get catalog item {item_id}: {result['error']}")
-        return json.dumps({
-            "success": False,
-            "message": f"Failed to get catalog item: {result['error']}",
-            "data": None
-        })
-
+        return json.dumps({"success": False, "message": f"Error: {result['error']}", "data": None})
+    
     item = result.get("result", {})
-
     if not item:
-        logger.warning(f"Catalog item not found: {item_id}")
-        return json.dumps({
-            "success": False,
-            "message": f"Catalog item not found: {item_id}",
-            "data": None
-        })
+        return json.dumps({"success": False, "message": "Item not found", "data": None})
 
-    # Query item_option_new table for variable schema
+    # 3. Récupération des Variables (Questions)
+    # On ajoute sys_id pour pouvoir chercher les choix liés
+    var_fields = CATALOG_VARIABLE_FIELDS + ",sys_id" 
+    
     var_params = {
         "sysparm_query": f"cat_item={item_id}",
-        "sysparm_fields": CATALOG_VARIABLE_FIELDS,
+        "sysparm_fields": var_fields,
         "sysparm_display_value": "true",
         "sysparm_exclude_reference_link": "true"
     }
-
-    logger.debug(f"Fetching variables for catalog item: {item_id}")
     var_result = make_request("GET", "table/item_option_new", params=var_params)
     variables = var_result.get("result", []) if "error" not in var_result else []
 
-    # Build variable schema with clear naming for LLM consumption
+    # 4. Construction du schéma avec récupération des CHOIX (Options)
     variables_schema = []
     mandatory_fields = []
 
     for var in variables:
+        var_sys_id = var.get("sys_id")
         var_name = var.get("name", "")
+        var_type = var.get("type") # 5=Select Box, 3=Multiple Choice, etc.
         is_mandatory = var.get("mandatory") in ["true", True, "1"]
 
+        # Structure de base de la variable
         variable_info = {
-            "name": var_name,  # Use this as the key in submit_catalog_request
+            "name": var_name,
             "label": var.get("question_text", ""),
-            "type": var.get("type", "string"),
+            "type": var_type,
             "mandatory": is_mandatory,
-            "help_text": var.get("help_text", "")
+            "help_text": var.get("help_text", ""),
+            "choices": [] # On prépare la liste des choix
         }
-        variables_schema.append(variable_info)
 
+        # SI c'est un type "Select Box" (5) ou "Radio" (3), on va chercher les choix
+        # Note : Les types peuvent varier selon ta version de SN, mais souvent 3 et 5 sont des listes
+        if var_sys_id:
+            choice_params = {
+                "sysparm_query": f"question={var_sys_id}^inactive=false", # Seulement les choix actifs liée à cette question
+                "sysparm_fields": "text,value",
+                "sysparm_order": "order"
+            }
+            choice_result = make_request("GET", "table/question_choice", params=choice_params)
+            choices_data = choice_result.get("result", [])
+            
+            if choices_data:
+                # On ajoute la liste des choix possibles (Label + Valeur)
+                variable_info["choices"] = [
+                    {"label": c.get("text"), "value": c.get("value")} 
+                    for c in choices_data
+                ]
+
+        variables_schema.append(variable_info)
         if is_mandatory and var_name:
             mandatory_fields.append(var_name)
 
@@ -1629,19 +1628,13 @@ def get_catalog_item(item_id: str) -> str:
         "name": item.get("name"),
         "short_description": item.get("short_description"),
         "price": item.get("price"),
-        # Schema for submit_catalog_request - use 'name' field as keys
         "variables_schema": variables_schema,
-        # Quick reference for required fields
-        "mandatory_variables": mandatory_fields,
-        # Usage hint for the LLM
-        "ordering_hint": f"To order this item, call submit_catalog_request with item_id='{item_id}' and variables containing: {', '.join(mandatory_fields) if mandatory_fields else 'no mandatory fields'}"
+        "mandatory_variables": mandatory_fields
     }
-
-    logger.info(f"Catalog item found: {item.get('name')} with {len(variables)} variables ({len(mandatory_fields)} mandatory)")
 
     return json.dumps({
         "success": True,
-        "message": f"Catalog item '{item.get('name')}' found with {len(variables)} variables. Use the 'name' field from variables_schema as keys when calling submit_catalog_request.",
+        "message": f"Found item '{item.get('name')}'. The 'variables_schema' contains the valid choices (if any). Use them to guide the user.",
         "data": item_data
     })
 
