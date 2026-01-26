@@ -1,7 +1,9 @@
 import os
 import logging
 import json
+import re
 import requests
+from functools import lru_cache
 from typing import Optional
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
@@ -106,6 +108,7 @@ class WorkflowState:
     def all_values(cls):
         return ["draft", "published", "retired"]
 
+
 # Initialisation du serveur
 mcp = FastMCP("ServiceNow Agent", host="0.0.0.0", port=8000)
 
@@ -125,6 +128,28 @@ session.headers.update({
     "Content-Type": "application/json",
     "Accept": "application/json"
 })
+
+
+# ========== FIELD DEFINITIONS FOR OPTIMIZED QUERIES ==========
+# Only request the fields we actually need to reduce payload size by ~90%
+
+INCIDENT_LIST_FIELDS = "number,sys_id,short_description,state,priority,assigned_to,category,sys_created_on,sys_updated_on"
+INCIDENT_DETAIL_FIELDS = "number,sys_id,short_description,description,state,priority,urgency,impact,assigned_to,category,subcategory,sys_created_on,sys_updated_on"
+INCIDENT_RESOLVER_FIELDS = "sys_id"
+
+CHANGE_LIST_FIELDS = "number,sys_id,short_description,type,state,risk,impact,start_date,end_date,sys_created_on,sys_updated_on"
+CHANGE_DETAIL_FIELDS = "number,sys_id,short_description,description,type,state,risk,impact,priority,start_date,end_date,assigned_to,assignment_group,sys_created_on,sys_updated_on"
+CHANGE_TASK_FIELDS = "number,short_description,state,assigned_to"
+CHANGE_RESOLVER_FIELDS = "sys_id"
+
+ARTICLE_LIST_FIELDS = "number,sys_id,short_description,kb_knowledge_base,kb_category,workflow_state,author,sys_created_on,sys_updated_on"
+ARTICLE_DETAIL_FIELDS = "number,sys_id,short_description,text,kb_knowledge_base,kb_category,workflow_state,author,keywords,article_type,view_count,sys_created_on,sys_updated_on"
+
+CATALOG_LIST_FIELDS = "sys_id,name,short_description,category,price,active,order"
+# Minimal fields for catalog item details (optimized for ordering workflow)
+CATALOG_DETAIL_FIELDS = "sys_id,name,short_description,price"
+# Variable fields required for submit_catalog_request - provides the schema for ordering
+CATALOG_VARIABLE_FIELDS = "name,question_text,type,mandatory,help_text"
 
 
 # ========== VALIDATION FUNCTIONS ==========
@@ -235,6 +260,57 @@ def validate_workflow_state(state: str) -> tuple[bool, str]:
     return True, ""
 
 
+def validate_sys_id(sys_id: str) -> tuple[bool, str]:
+    """Validate ServiceNow sys_id format (32-character hexadecimal).
+
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    if not sys_id:
+        return False, "sys_id is required"
+
+    if len(sys_id) != 32:
+        return False, f"Invalid sys_id format: must be 32 characters, got {len(sys_id)}"
+
+    if not all(c in "0123456789abcdef" for c in sys_id.lower()):
+        return False, "Invalid sys_id format: must contain only hexadecimal characters (0-9, a-f)"
+
+    return True, ""
+
+
+def clean_json_from_markdown(json_str: str) -> str:
+    """Clean JSON string by removing markdown code block wrappers.
+
+    LLMs often wrap JSON in markdown code blocks like ```json ... ```.
+    This function strips those wrappers to get clean JSON.
+
+    Args:
+        json_str: Potentially markdown-wrapped JSON string
+
+    Returns:
+        Clean JSON string without markdown formatting
+    """
+    if not json_str:
+        return json_str
+
+    # Remove leading/trailing whitespace
+    cleaned = json_str.strip()
+
+    # Pattern to match ```json or ``` at start and ``` at end
+    # Handles: ```json\n{...}\n``` or ```\n{...}\n```
+    markdown_pattern = re.compile(
+        r'^```(?:json)?\s*\n?(.*?)\n?```$',
+        re.DOTALL | re.IGNORECASE
+    )
+
+    match = markdown_pattern.match(cleaned)
+    if match:
+        cleaned = match.group(1).strip()
+        logger.debug("Removed markdown code block wrapper from JSON input")
+
+    return cleaned
+
+
 # ========== HELPER FUNCTIONS ==========
 
 def make_request(method: str, endpoint: str, data: dict = None, params: dict = None) -> dict:
@@ -262,16 +338,22 @@ def make_request(method: str, endpoint: str, data: dict = None, params: dict = N
         return {"error": str(e)}
 
 
+@lru_cache(maxsize=128)
 def resolve_incident_id(incident_id: str) -> Optional[str]:
-    """Helper to resolve incident number to sys_id."""
+    """Helper to resolve incident number to sys_id.
+
+    Cached with LRU cache for performance optimization.
+    Uses minimal field selection to reduce API payload.
+    """
     # Check if it's already a sys_id (32 hex chars)
     if len(incident_id) == 32 and all(c in "0123456789abcdef" for c in incident_id):
         return incident_id
 
-    # Otherwise, query by incident number
+    # Otherwise, query by incident number with minimal fields
     params = {
         "sysparm_query": f"number={incident_id}",
-        "sysparm_limit": 1
+        "sysparm_limit": 1,
+        "sysparm_fields": INCIDENT_RESOLVER_FIELDS
     }
 
     result = make_request("GET", "table/incident", params=params)
@@ -285,16 +367,22 @@ def resolve_incident_id(incident_id: str) -> Optional[str]:
     return incidents[0].get("sys_id")
 
 
+@lru_cache(maxsize=128)
 def resolve_change_id(change_id: str) -> Optional[str]:
-    """Helper to resolve change request number to sys_id."""
+    """Helper to resolve change request number to sys_id.
+
+    Cached with LRU cache for performance optimization.
+    Uses minimal field selection to reduce API payload.
+    """
     # Check if it's already a sys_id (32 hex chars)
     if len(change_id) == 32 and all(c in "0123456789abcdef" for c in change_id):
         return change_id
 
-    # Otherwise, query by change number
+    # Otherwise, query by change number with minimal fields
     params = {
         "sysparm_query": f"number={change_id}",
-        "sysparm_limit": 1
+        "sysparm_limit": 1,
+        "sysparm_fields": CHANGE_RESOLVER_FIELDS
     }
 
     result = make_request("GET", "table/change_request", params=params)
@@ -608,6 +696,7 @@ def list_incidents(
 
     params = {
         "sysparm_limit": limit,
+        "sysparm_fields": INCIDENT_LIST_FIELDS,
         "sysparm_display_value": "true",
         "sysparm_exclude_reference_link": "true"
     }
@@ -662,6 +751,7 @@ def get_incident_by_number(incident_number: str) -> str:
     params = {
         "sysparm_query": f"number={incident_number}",
         "sysparm_limit": 1,
+        "sysparm_fields": INCIDENT_DETAIL_FIELDS,
         "sysparm_display_value": "true",
         "sysparm_exclude_reference_link": "true"
     }
@@ -944,6 +1034,7 @@ def list_change_requests(
 
     params = {
         "sysparm_limit": limit,
+        "sysparm_fields": CHANGE_LIST_FIELDS,
         "sysparm_display_value": "true",
         "sysparm_exclude_reference_link": "true"
     }
@@ -1006,8 +1097,9 @@ def get_change_request_details(change_id: str) -> str:
             "data": None
         })
 
-    # Get the change request
+    # Get the change request with optimized field selection
     params = {
+        "sysparm_fields": CHANGE_DETAIL_FIELDS,
         "sysparm_display_value": "true",
         "sysparm_exclude_reference_link": "true"
     }
@@ -1023,9 +1115,10 @@ def get_change_request_details(change_id: str) -> str:
 
     chg = result.get("result", {})
 
-    # Get associated tasks
+    # Get associated tasks with optimized field selection
     task_params = {
         "sysparm_query": f"change_request={change_id}",
+        "sysparm_fields": CHANGE_TASK_FIELDS,
         "sysparm_display_value": "true"
     }
 
@@ -1194,11 +1287,14 @@ def list_articles(
 ) -> str:
     """List knowledge articles with optional filters.
 
+    Uses ServiceNow's Zing full-text search engine for query searches,
+    providing stemming, relevance scoring, and better search results.
+
     Args:
         limit: Maximum number of articles to return (default: 10)
         knowledge_base: Filter by knowledge base sys_id
         category: Filter by category sys_id
-        query: Search query for article content
+        query: Full-text search query (uses Zing search engine for relevance)
         workflow_state: Filter by workflow state (draft, published, retired)
 
     Returns:
@@ -1223,11 +1319,14 @@ def list_articles(
         filters.append(f"kb_category={category}")
     if workflow_state:
         filters.append(f"workflow_state={workflow_state}")
+
+    # Use Zing full-text search instead of LIKE for better relevance and performance
     if query:
-        filters.append(f"short_descriptionLIKE{query}^ORtextLIKE{query}")
+        filters.append(f"123TEXTQUERY321={query}")
 
     params = {
         "sysparm_limit": limit,
+        "sysparm_fields": ARTICLE_LIST_FIELDS,
         "sysparm_display_value": "true",
         "sysparm_exclude_reference_link": "true"
     }
@@ -1280,6 +1379,7 @@ def get_article(article_id: str) -> str:
     logger.info(f"Getting article: {article_id}")
 
     params = {
+        "sysparm_fields": ARTICLE_DETAIL_FIELDS,
         "sysparm_display_value": "true",
         "sysparm_exclude_reference_link": "true"
     }
@@ -1320,7 +1420,7 @@ def get_article(article_id: str) -> str:
     })
 
 
-# ========== SERVICE CATALOG (2 tools) ==========
+# ========== SERVICE CATALOG (3 tools) ==========
 
 @mcp.tool()
 def list_catalog_items(
@@ -1353,6 +1453,7 @@ def list_catalog_items(
 
     params = {
         "sysparm_limit": limit,
+        "sysparm_fields": CATALOG_LIST_FIELDS,
         "sysparm_display_value": "true",
         "sysparm_exclude_reference_link": "true"
     }
@@ -1392,17 +1493,39 @@ def list_catalog_items(
 
 @mcp.tool()
 def get_catalog_item(item_id: str) -> str:
-    """Get details of a specific catalog item.
+    """Get details of a specific catalog item including the variable schema for ordering.
+
+    This tool provides the information needed to call submit_catalog_request.
+    The 'variables_schema' in the response shows which keys to use in the
+    'variables' JSON parameter when ordering.
 
     Args:
-        item_id: Catalog item sys_id
+        item_id: Catalog item sys_id (32-character hexadecimal)
 
     Returns:
-        JSON string with catalog item details including variables/form fields
+        JSON string with catalog item details and variable schema for ordering.
+        The 'variables_schema' array shows:
+        - name: The technical key to use in submit_catalog_request variables
+        - label: Human-readable description of the field
+        - type: Data type (string, integer, reference, etc.)
+        - mandatory: Whether the field is required (true/false)
+        - help_text: Additional guidance for the field
     """
     logger.info(f"Getting catalog item: {item_id}")
 
+    # Validate item_id format
+    valid, error = validate_sys_id(item_id)
+    if not valid:
+        logger.warning(f"Invalid item_id format: {error}")
+        return json.dumps({
+            "success": False,
+            "message": error,
+            "data": None
+        })
+
+    # Get item details with minimal fields
     params = {
+        "sysparm_fields": CATALOG_DETAIL_FIELDS,
         "sysparm_display_value": "true",
         "sysparm_exclude_reference_link": "true"
     }
@@ -1410,6 +1533,7 @@ def get_catalog_item(item_id: str) -> str:
     result = make_request("GET", f"table/sc_cat_item/{item_id}", params=params)
 
     if "error" in result:
+        logger.error(f"Failed to get catalog item {item_id}: {result['error']}")
         return json.dumps({
             "success": False,
             "message": f"Failed to get catalog item: {result['error']}",
@@ -1418,45 +1542,206 @@ def get_catalog_item(item_id: str) -> str:
 
     item = result.get("result", {})
 
-    # Get catalog item variables
+    if not item:
+        logger.warning(f"Catalog item not found: {item_id}")
+        return json.dumps({
+            "success": False,
+            "message": f"Catalog item not found: {item_id}",
+            "data": None
+        })
+
+    # Query item_option_new table for variable schema
     var_params = {
         "sysparm_query": f"cat_item={item_id}",
-        "sysparm_display_value": "true"
+        "sysparm_fields": CATALOG_VARIABLE_FIELDS,
+        "sysparm_display_value": "true",
+        "sysparm_exclude_reference_link": "true"
     }
 
+    logger.debug(f"Fetching variables for catalog item: {item_id}")
     var_result = make_request("GET", "table/item_option_new", params=var_params)
     variables = var_result.get("result", []) if "error" not in var_result else []
+
+    # Build variable schema with clear naming for LLM consumption
+    variables_schema = []
+    mandatory_fields = []
+
+    for var in variables:
+        var_name = var.get("name", "")
+        is_mandatory = var.get("mandatory") in ["true", True, "1"]
+
+        variable_info = {
+            "name": var_name,  # Use this as the key in submit_catalog_request
+            "label": var.get("question_text", ""),
+            "type": var.get("type", "string"),
+            "mandatory": is_mandatory,
+            "help_text": var.get("help_text", "")
+        }
+        variables_schema.append(variable_info)
+
+        if is_mandatory and var_name:
+            mandatory_fields.append(var_name)
 
     item_data = {
         "sys_id": item.get("sys_id"),
         "name": item.get("name"),
         "short_description": item.get("short_description"),
-        "description": item.get("description"),
-        "category": item.get("category"),
         "price": item.get("price"),
-        "active": item.get("active"),
-        "order": item.get("order"),
-        "delivery_time": item.get("delivery_time"),
-        "availability": item.get("availability"),
-        "variables": [
-            {
-                "name": var.get("name"),
-                "label": var.get("question_text"),
-                "type": var.get("type"),
-                "mandatory": var.get("mandatory"),
-                "default_value": var.get("default_value"),
-                "help_text": var.get("help_text")
-            }
-            for var in variables
-        ]
+        # Schema for submit_catalog_request - use 'name' field as keys
+        "variables_schema": variables_schema,
+        # Quick reference for required fields
+        "mandatory_variables": mandatory_fields,
+        # Usage hint for the LLM
+        "ordering_hint": f"To order this item, call submit_catalog_request with item_id='{item_id}' and variables containing: {', '.join(mandatory_fields) if mandatory_fields else 'no mandatory fields'}"
     }
 
-    logger.info(f"Catalog item found: {item.get('name')} with {len(variables)} variables")
+    logger.info(f"Catalog item found: {item.get('name')} with {len(variables)} variables ({len(mandatory_fields)} mandatory)")
 
     return json.dumps({
         "success": True,
-        "message": f"Catalog item {item.get('name')} found with {len(variables)} variables",
+        "message": f"Catalog item '{item.get('name')}' found with {len(variables)} variables. Use the 'name' field from variables_schema as keys when calling submit_catalog_request.",
         "data": item_data
+    })
+
+
+@mcp.tool()
+def submit_catalog_request(
+    item_id: str,
+    variables: str = None,
+    quantity: int = 1
+) -> str:
+    """Submit an order for a service catalog item.
+
+    Uses the ServiceNow Service Catalog API (sn_sc namespace) to order items.
+    Call get_catalog_item first to see which variables are required.
+
+    Args:
+        item_id: Catalog item sys_id (32-character hexadecimal string)
+        variables: JSON string of catalog item variables. Use the 'name' fields
+                   from get_catalog_item's variables_schema as keys.
+                   Example: '{"requested_for": "user_sys_id", "justification": "Business need"}'
+                   Note: Markdown code blocks (```json...```) are automatically stripped.
+        quantity: Number of items to order (default: 1)
+
+    Returns:
+        JSON string with request details including request number
+    """
+    logger.info(f"Submitting catalog request for item: {item_id}")
+
+    # Validate environment variables
+    if not SN_INSTANCE or not SN_USER or not SN_PASSWORD:
+        logger.error("ServiceNow credentials not configured")
+        return json.dumps({
+            "success": False,
+            "message": "Environment variables SN_INSTANCE, SN_USER, and SN_PASSWORD must be set",
+            "data": None
+        })
+
+    # Validate item_id format locally (32-char hex)
+    valid, error = validate_sys_id(item_id)
+    if not valid:
+        logger.warning(f"Invalid item_id: {error}")
+        return json.dumps({
+            "success": False,
+            "message": f"Invalid item_id: {error}",
+            "data": None
+        })
+
+    # Validate quantity
+    if quantity < 1:
+        logger.warning(f"Invalid quantity: {quantity}")
+        return json.dumps({
+            "success": False,
+            "message": "Quantity must be at least 1",
+            "data": None
+        })
+
+    # Parse and clean variables JSON
+    parsed_variables = {}
+    if variables:
+        # Clean markdown code block wrappers if present
+        cleaned_variables = clean_json_from_markdown(variables)
+
+        try:
+            parsed_variables = json.loads(cleaned_variables)
+            if not isinstance(parsed_variables, dict):
+                logger.warning("Variables is not a JSON object")
+                return json.dumps({
+                    "success": False,
+                    "message": "Variables must be a JSON object (dictionary), not an array or primitive",
+                    "data": None
+                })
+            logger.debug(f"Parsed {len(parsed_variables)} variables for catalog request")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse variables JSON: {e}")
+            return json.dumps({
+                "success": False,
+                "message": f"Invalid JSON in variables parameter: {str(e)}. Ensure proper JSON format without trailing commas.",
+                "data": None
+            })
+
+    # Build the order payload for sn_sc API
+    payload = {
+        "sysparm_quantity": str(quantity),
+        "variables": parsed_variables
+    }
+
+    # Direct API call to Service Catalog namespace (sn_sc)
+    # Note: This uses a different API path than the standard Table API
+    url = f"https://{SN_INSTANCE}.service-now.com/api/sn_sc/servicecatalog/items/{item_id}/order_now"
+
+    logger.info(f"Calling Service Catalog API: POST {url}")
+
+    try:
+        response = session.post(
+            url,
+            json=payload,
+            timeout=REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
+        result = response.json()
+    except requests.exceptions.Timeout:
+        logger.error(f"Request timeout after {REQUEST_TIMEOUT}s")
+        return json.dumps({
+            "success": False,
+            "message": f"Request timeout after {REQUEST_TIMEOUT} seconds",
+            "data": None
+        })
+    except requests.exceptions.HTTPError as e:
+        error_detail = e.response.text[:500] if e.response else str(e)
+        logger.error(f"HTTP error submitting catalog request: {e.response.status_code} - {error_detail}")
+        return json.dumps({
+            "success": False,
+            "message": f"Failed to submit catalog request: HTTP {e.response.status_code}. Check that item_id is valid and all mandatory variables are provided.",
+            "data": {"error_detail": error_detail}
+        })
+    except requests.RequestException as e:
+        logger.error(f"Request failed: {e}")
+        return json.dumps({
+            "success": False,
+            "message": f"Request failed: {str(e)}",
+            "data": None
+        })
+
+    request_data = result.get("result", {})
+
+    # Extract relevant information from the response
+    request_number = request_data.get("request_number") or request_data.get("number")
+    request_id = request_data.get("request_id") or request_data.get("sys_id")
+
+    logger.info(f"Catalog request submitted successfully: {request_number}")
+
+    return json.dumps({
+        "success": True,
+        "message": f"Catalog request submitted successfully: {request_number}",
+        "data": {
+            "request_number": request_number,
+            "request_id": request_id,
+            "item_id": item_id,
+            "quantity": quantity,
+            "table": request_data.get("table", "sc_request"),
+            "redirect_url": request_data.get("redirect_url")
+        }
     })
 
 
