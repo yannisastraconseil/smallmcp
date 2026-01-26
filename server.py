@@ -147,6 +147,16 @@ ARTICLE_LIST_FIELDS = "number,sys_id,short_description,sys_view_count"
 # Article detail: only essential fields for reading (text contains HTML)
 ARTICLE_DETAIL_FIELDS = "number,short_description,text"
 
+# Pre-compiled regex patterns for HTML cleaning (performance optimization)
+RE_SCRIPT = re.compile(r'<script[^>]*>.*?</script>', re.DOTALL | re.IGNORECASE)
+RE_STYLE = re.compile(r'<style[^>]*>.*?</style>', re.DOTALL | re.IGNORECASE)
+RE_BR = re.compile(r'<br\s*/?>', re.IGNORECASE)
+RE_P_END = re.compile(r'</p>', re.IGNORECASE)
+RE_DIV_END = re.compile(r'</div>', re.IGNORECASE)
+RE_LI = re.compile(r'<li[^>]*>', re.IGNORECASE)
+RE_ALL_TAGS = re.compile(r'<[^>]+>')
+RE_MULTI_NEWLINE = re.compile(r'\n\s*\n')
+
 CATALOG_LIST_FIELDS = "sys_id,name,short_description,category,price,active,order"
 # Minimal fields for catalog item details (optimized for ordering workflow)
 CATALOG_DETAIL_FIELDS = "sys_id,name,short_description,price"
@@ -454,8 +464,11 @@ def create_incident(
     if priority:
         payload["priority"] = priority
 
-    # Limit response fields for faster API response
-    result = make_request("POST", "table/incident", data=payload, params={"sysparm_fields": "number,sys_id"})
+    # Limit response fields and exclude reference links for faster API response
+    result = make_request("POST", "table/incident", data=payload, params={
+        "sysparm_fields": "number,sys_id",
+        "sysparm_exclude_reference_link": "true"
+    })
 
     if "error" in result:
         return json.dumps({
@@ -1407,21 +1420,21 @@ def get_article(article_id: str) -> str:
     text_content = art.get("text", "")
 
     # Basic HTML tag stripping for cleaner LLM consumption
-    # Remove common HTML tags while preserving content
+    # Uses pre-compiled regex patterns for performance
     if text_content:
         # Remove script and style tags with content
-        text_content = re.sub(r'<script[^>]*>.*?</script>', '', text_content, flags=re.DOTALL | re.IGNORECASE)
-        text_content = re.sub(r'<style[^>]*>.*?</style>', '', text_content, flags=re.DOTALL | re.IGNORECASE)
+        text_content = RE_SCRIPT.sub('', text_content)
+        text_content = RE_STYLE.sub('', text_content)
         # Replace <br>, <p>, <div> with newlines
-        text_content = re.sub(r'<br\s*/?>', '\n', text_content, flags=re.IGNORECASE)
-        text_content = re.sub(r'</p>', '\n', text_content, flags=re.IGNORECASE)
-        text_content = re.sub(r'</div>', '\n', text_content, flags=re.IGNORECASE)
+        text_content = RE_BR.sub('\n', text_content)
+        text_content = RE_P_END.sub('\n', text_content)
+        text_content = RE_DIV_END.sub('\n', text_content)
         # Replace list items with bullet points
-        text_content = re.sub(r'<li[^>]*>', '• ', text_content, flags=re.IGNORECASE)
+        text_content = RE_LI.sub('• ', text_content)
         # Remove remaining HTML tags
-        text_content = re.sub(r'<[^>]+>', '', text_content)
+        text_content = RE_ALL_TAGS.sub('', text_content)
         # Clean up whitespace
-        text_content = re.sub(r'\n\s*\n', '\n\n', text_content)
+        text_content = RE_MULTI_NEWLINE.sub('\n\n', text_content)
         text_content = text_content.strip()
 
     article_data = {
