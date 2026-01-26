@@ -142,8 +142,10 @@ CHANGE_DETAIL_FIELDS = "number,sys_id,short_description,description,type,state,r
 CHANGE_TASK_FIELDS = "number,short_description,state,assigned_to"
 CHANGE_RESOLVER_FIELDS = "sys_id"
 
-ARTICLE_LIST_FIELDS = "number,sys_id,short_description,kb_knowledge_base,kb_category,workflow_state,author,sys_created_on,sys_updated_on"
-ARTICLE_DETAIL_FIELDS = "number,sys_id,short_description,text,kb_knowledge_base,kb_category,workflow_state,author,keywords,article_type,view_count,sys_created_on,sys_updated_on"
+# Article list: minimal fields for search results (fetch full text only via get_article)
+ARTICLE_LIST_FIELDS = "number,sys_id,short_description,sys_view_count"
+# Article detail: only essential fields for reading (text contains HTML)
+ARTICLE_DETAIL_FIELDS = "number,short_description,text"
 
 CATALOG_LIST_FIELDS = "sys_id,name,short_description,category,price,active,order"
 # Minimal fields for catalog item details (optimized for ordering workflow)
@@ -408,6 +410,10 @@ def create_incident(
 ) -> str:
     """Create a new incident in ServiceNow.
 
+    IMPORTANT: MUST ONLY be used if no relevant Knowledge Articles were found,
+    or if the user explicitly confirms the articles did not solve their problem.
+    Always search for knowledge articles first using list_articles before creating an incident.
+
     Args:
         short_description: Brief description of the incident
         urgency: Urgency level (1=High, 2=Medium, 3=Low)
@@ -448,7 +454,8 @@ def create_incident(
     if priority:
         payload["priority"] = priority
 
-    result = make_request("POST", "table/incident", data=payload)
+    # Limit response fields for faster API response
+    result = make_request("POST", "table/incident", data=payload, params={"sysparm_fields": "number,sys_id"})
 
     if "error" in result:
         return json.dumps({
@@ -1279,28 +1286,29 @@ def update_article(
 
 @mcp.tool()
 def list_articles(
-    limit: int = 10,
+    limit: int = 3,
     knowledge_base: str = None,
     category: str = None,
     query: str = None,
     workflow_state: str = None
 ) -> str:
-    """List knowledge articles with optional filters.
+    """Search for knowledge articles to solve the user's issue.
 
+    IMPORTANT: Always present these articles to the user BEFORE creating an incident.
     Uses ServiceNow's Zing full-text search engine for query searches,
     providing stemming, relevance scoring, and better search results.
 
     Args:
-        limit: Maximum number of articles to return (default: 10)
+        limit: Maximum number of articles to return (default: 3)
         knowledge_base: Filter by knowledge base sys_id
         category: Filter by category sys_id
         query: Full-text search query (uses Zing search engine for relevance)
         workflow_state: Filter by workflow state (draft, published, retired)
 
     Returns:
-        JSON string with list of articles
+        JSON string with list of articles (use get_article to fetch full content)
     """
-    logger.info(f"Listing articles (limit={limit})")
+    logger.info(f"Searching knowledge articles (limit={limit})")
 
     # Validate inputs
     valid, error = validate_workflow_state(workflow_state)
@@ -1349,32 +1357,32 @@ def list_articles(
             "number": art.get("number"),
             "sys_id": art.get("sys_id"),
             "short_description": art.get("short_description"),
-            "kb_knowledge_base": art.get("kb_knowledge_base"),
-            "kb_category": art.get("kb_category"),
-            "workflow_state": art.get("workflow_state"),
-            "author": art.get("author"),
-            "created_on": art.get("sys_created_on"),
-            "updated_on": art.get("sys_updated_on")
+            "view_count": art.get("sys_view_count")
         })
 
-    logger.info(f"Found {len(articles)} articles")
+    logger.info(f"Found {len(articles)} knowledge articles")
 
     return json.dumps({
         "success": True,
-        "message": f"Found {len(articles)} articles",
+        "message": f"Found {len(articles)} knowledge articles. Present these to the user before considering incident creation. Use get_article(sys_id) to fetch full article content.",
         "data": articles
     })
 
 
 @mcp.tool()
 def get_article(article_id: str) -> str:
-    """Get a specific knowledge article by ID.
+    """Get a specific knowledge article by ID to show the user.
+
+    Use this to fetch the full content of an article found via list_articles.
+    Present the article content to the user to help solve their issue.
 
     Args:
-        article_id: Article sys_id
+        article_id: Article sys_id (from list_articles results)
 
     Returns:
-        JSON string with full article details including content
+        JSON string with article content. NOTE: The 'text' field contains HTML
+        markup which should be interpreted as formatted content when presenting
+        to the user.
     """
     logger.info(f"Getting article: {article_id}")
 
@@ -1395,27 +1403,38 @@ def get_article(article_id: str) -> str:
 
     art = result.get("result", {})
 
+    # Get the text content and clean basic HTML tags for readability
+    text_content = art.get("text", "")
+
+    # Basic HTML tag stripping for cleaner LLM consumption
+    # Remove common HTML tags while preserving content
+    if text_content:
+        # Remove script and style tags with content
+        text_content = re.sub(r'<script[^>]*>.*?</script>', '', text_content, flags=re.DOTALL | re.IGNORECASE)
+        text_content = re.sub(r'<style[^>]*>.*?</style>', '', text_content, flags=re.DOTALL | re.IGNORECASE)
+        # Replace <br>, <p>, <div> with newlines
+        text_content = re.sub(r'<br\s*/?>', '\n', text_content, flags=re.IGNORECASE)
+        text_content = re.sub(r'</p>', '\n', text_content, flags=re.IGNORECASE)
+        text_content = re.sub(r'</div>', '\n', text_content, flags=re.IGNORECASE)
+        # Replace list items with bullet points
+        text_content = re.sub(r'<li[^>]*>', '• ', text_content, flags=re.IGNORECASE)
+        # Remove remaining HTML tags
+        text_content = re.sub(r'<[^>]+>', '', text_content)
+        # Clean up whitespace
+        text_content = re.sub(r'\n\s*\n', '\n\n', text_content)
+        text_content = text_content.strip()
+
     article_data = {
         "number": art.get("number"),
-        "sys_id": art.get("sys_id"),
         "short_description": art.get("short_description"),
-        "text": art.get("text"),
-        "kb_knowledge_base": art.get("kb_knowledge_base"),
-        "kb_category": art.get("kb_category"),
-        "workflow_state": art.get("workflow_state"),
-        "author": art.get("author"),
-        "keywords": art.get("keywords"),
-        "article_type": art.get("article_type"),
-        "view_count": art.get("view_count"),
-        "created_on": art.get("sys_created_on"),
-        "updated_on": art.get("sys_updated_on")
+        "text": text_content
     }
 
     logger.info(f"Article found: {art.get('number')}")
 
     return json.dumps({
         "success": True,
-        "message": f"Article {art.get('number')} found",
+        "message": f"Article {art.get('number')} retrieved. Present this content to the user to help solve their issue.",
         "data": article_data
     })
 
