@@ -1397,8 +1397,12 @@ def get_article(article_id: str) -> str:
         markup which should be interpreted as formatted content when presenting
         to the user.
     """
-    logger.info(f"Getting article: {article_id}")
+    return json.dumps(_fetch_article_content(article_id))
 
+
+@lru_cache(maxsize=32)
+def _fetch_article_content(article_id: str) -> dict:
+    """Internal helper to fetch and cache article content."""
     params = {
         "sysparm_fields": ARTICLE_DETAIL_FIELDS,
         "sysparm_display_value": "true",
@@ -1408,11 +1412,11 @@ def get_article(article_id: str) -> str:
     result = make_request("GET", f"table/kb_knowledge/{article_id}", params=params)
 
     if "error" in result:
-        return json.dumps({
+        return {
             "success": False,
             "message": f"Failed to get article: {result['error']}",
             "data": None
-        })
+        }
 
     art = result.get("result", {})
 
@@ -1426,15 +1430,15 @@ def get_article(article_id: str) -> str:
         text_content = RE_SCRIPT.sub('', text_content)
         text_content = RE_STYLE.sub('', text_content)
         # Replace <br>, <p>, <div> with newlines
-        text_content = RE_BR.sub('\n', text_content)
-        text_content = RE_P_END.sub('\n', text_content)
-        text_content = RE_DIV_END.sub('\n', text_content)
+        text_content = RE_BR.sub('\\n', text_content)
+        text_content = RE_P_END.sub('\\n', text_content)
+        text_content = RE_DIV_END.sub('\\n', text_content)
         # Replace list items with bullet points
         text_content = RE_LI.sub('• ', text_content)
         # Remove remaining HTML tags
         text_content = RE_ALL_TAGS.sub('', text_content)
         # Clean up whitespace
-        text_content = RE_MULTI_NEWLINE.sub('\n\n', text_content)
+        text_content = RE_MULTI_NEWLINE.sub('\\n\\n', text_content)
         text_content = text_content.strip()
 
     article_data = {
@@ -1444,6 +1448,12 @@ def get_article(article_id: str) -> str:
     }
 
     logger.info(f"Article found: {art.get('number')}")
+
+    return {
+        "success": True,
+        "message": f"Article {art.get('number')} retrieved. Present this content to the user to help solve their issue.",
+        "data": article_data
+    }
 
     return json.dumps({
         "success": True,
