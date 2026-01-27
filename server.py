@@ -1371,7 +1371,8 @@ def list_articles(
             "number": art.get("number"),
             "sys_id": art.get("sys_id"),
             "short_description": art.get("short_description"),
-            "view_count": art.get("sys_view_count")
+            "view_count": art.get("sys_view_count"),
+            "link": f"https://{SN_INSTANCE}.service-now.com/esc?id=kb_article&sysparm_article={art.get('number')}"
         })
 
     logger.info(f"Found {len(articles)} knowledge articles")
@@ -1445,7 +1446,8 @@ def _fetch_article_content(article_id: str) -> dict:
     article_data = {
         "number": art.get("number"),
         "short_description": art.get("short_description"),
-        "text": text_content
+        "text": text_content,
+        "link": f"https://{SN_INSTANCE}.service-now.com/esc?id=kb_article&sysparm_article={art.get('number')}"
     }
 
     logger.info(f"Article found: {art.get('number')}")
@@ -1455,12 +1457,6 @@ def _fetch_article_content(article_id: str) -> dict:
         "message": f"Article {art.get('number')} retrieved. Present this content to the user to help solve their issue.",
         "data": article_data
     }
-
-    return json.dumps({
-        "success": True,
-        "message": f"Article {art.get('number')} retrieved. Present this content to the user to help solve their issue.",
-        "data": article_data
-    })
 
 
 # ========== SERVICE CATALOG (3 tools) ==========
