@@ -1465,13 +1465,13 @@ def _fetch_article_content(article_id: str) -> dict:
 # ========== SERVICE CATALOG (3 tools) ==========
 
 @mcp.tool()
-def list_catalog_items(
+def search_catalog_items(
     limit: int = 10,
     category: str = None,
     query: str = None,
     active: bool = True
 ) -> str:
-    """List service catalog items.
+    """Search for service catalog items.
 
     Args:
         limit: Maximum number of items to return (default: 10)
@@ -1664,11 +1664,49 @@ def submit_catalog_request(
         logger.warning(f"Invalid item_id format (hallucination detected): {item_id}")
         return json.dumps({
             "success": False,
-            "message": f"❌ Error: The item_id '{item_id}' is invalid. It looks like a hallucination. Please use the 'list_catalog_items' tool first to get the real 32-character sys_id.",
+            "message": f"❌ Error: The item_id '{item_id}' is invalid. It looks like a hallucination. Please use the 'search_catalog_items' tool first to get the real 32-character sys_id.",
             "data": None
         })
 
-    # 1. Parsing des variables
+    # 1. VÉRIFICATION D'EXISTENCE (Le "Ping" Zero Trust)
+    # On interroge d'abord l'API pour voir si cet item existe vraiment
+    logger.info(f"Verifying existence of item: {item_id}")
+    check_params = {"sysparm_fields": "name", "sysparm_exclude_reference_link": "true"}
+    check_result = make_request("GET", f"table/sc_cat_item/{item_id}", params=check_params)
+
+    if "error" in check_result:
+        error_msg = check_result["error"]
+        if "404" in error_msg:
+             return json.dumps({
+                "success": False,
+                "message": f"⛔ ALERTE HALLUCINATION : L'ID '{item_id}' n'existe pas dans ServiceNow. Vous avez probablement inventé cet ID. Veuillez OBLIGATOIREMENT utiliser l'outil 'search_catalog_items' pour trouver le vrai sys_id avant de commander.",
+                "data": None
+            })
+        elif "403" in error_msg or "401" in error_msg:
+             return json.dumps({
+                "success": False,
+                "message": f"⛔ ACCÈS INTERDIT : L'item existe mais vous n'avez pas les droits pour le voir. (Erreur: {error_msg})",
+                "data": None
+            })
+        else:
+             # Other errors (500 etc) - fail safe
+             return json.dumps({
+                "success": False,
+                "message": f"Erreur lors de la vérification de l'item: {error_msg}",
+                "data": None
+            })
+            
+    if not check_result.get("result"):
+         return json.dumps({
+                "success": False,
+                "message": f"⛔ ALERTE HALLUCINATION : L'ID '{item_id}' n'existe pas dans ServiceNow (Résultat vide). Veuillez OBLIGATOIREMENT utiliser l'outil 'search_catalog_items' pour trouver le vrai sys_id.",
+                "data": None
+            })
+
+    real_item_name = check_result['result'].get('name')
+    logger.info(f"Item verified: {real_item_name}")
+
+    # 2. Parsing des variables
     parsed_variables = {}
     if variables:
         cleaned_variables = clean_json_from_markdown(variables)
