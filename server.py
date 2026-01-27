@@ -488,7 +488,8 @@ def create_incident(
             "sys_id": incident_data.get("sys_id"),
             "state": incident_data.get("state"),
             "priority": incident_data.get("priority"),
-            "urgency": incident_data.get("urgency")
+            "urgency": incident_data.get("urgency"),
+            "link": f"https://{SN_INSTANCE}.service-now.com/esc?id=ticket&table=incident&sys_id={incident_data.get('sys_id')}"
         }
     })
 
@@ -1749,7 +1750,14 @@ def submit_catalog_request(
         return json.dumps({"success": False, "message": f"Connection failed: {str(e)}", "data": None})
 
     # 4. Succès
+    # 4. Succès
     data = result.get("result", {})
+    # Ensure we get the correct sys_id, sometimes sn_sc returns 'request_id'
+    req_sys_id = data.get("request_id") or data.get("sys_id") or data.get("parent_id")
+    
+    # Enrich data with the link
+    data["link"] = f"https://{SN_INSTANCE}.service-now.com/esc?id=order_status&table=sc_request&sys_id={req_sys_id}"
+    
     return json.dumps({
         "success": True,
         "message": f"Order created successfully. Request Number: {data.get('number')}",
