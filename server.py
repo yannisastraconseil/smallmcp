@@ -1659,6 +1659,15 @@ def submit_catalog_request(
     if not SN_INSTANCE:
         return json.dumps({"success": False, "message": "Configuration error", "data": None})
 
+    # 0. Validation du format sys_id (Hallucination Guard)
+    if not re.fullmatch(r"[0-9a-f]{32}", item_id):
+        logger.warning(f"Invalid item_id format (hallucination detected): {item_id}")
+        return json.dumps({
+            "success": False,
+            "message": f"❌ Error: The item_id '{item_id}' is invalid. It looks like a hallucination. Please use the 'list_catalog_items' tool first to get the real 32-character sys_id.",
+            "data": None
+        })
+
     # 1. Parsing des variables
     parsed_variables = {}
     if variables:
