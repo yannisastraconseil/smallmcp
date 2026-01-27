@@ -1647,136 +1647,66 @@ def submit_catalog_request(
 ) -> str:
     """Submit an order for a service catalog item.
 
-    Uses the ServiceNow Service Catalog API (sn_sc namespace) to order items.
-    Call get_catalog_item first to see which variables are required.
-
     Args:
-        item_id: Catalog item sys_id (32-character hexadecimal string)
-        variables: JSON string of catalog item variables. Use the 'name' fields
-                   from get_catalog_item's variables_schema as keys.
-                   Example: '{"requested_for": "user_sys_id", "justification": "Business need"}'
-                   Note: Markdown code blocks (```json...```) are automatically stripped.
-        quantity: Number of items to order (default: 1)
-
-    Returns:
-        JSON string with request details including request number
+        item_id: Catalog item sys_id.
+        variables: JSON string of variables. 
+                   IMPORTANT: For 'Select Box' or 'Radio', you must send the 'value' (not the label).
+                   For 'Reference' fields (like User), you must send the 'sys_id'.
+        quantity: Number of items (default: 1).
     """
     logger.info(f"Submitting catalog request for item: {item_id}")
 
-    # Validate environment variables
-    if not SN_INSTANCE or not SN_USER or not SN_PASSWORD:
-        logger.error("ServiceNow credentials not configured")
-        return json.dumps({
-            "success": False,
-            "message": "Environment variables SN_INSTANCE, SN_USER, and SN_PASSWORD must be set",
-            "data": None
-        })
+    if not SN_INSTANCE:
+        return json.dumps({"success": False, "message": "Configuration error", "data": None})
 
-    # Validate item_id format locally (32-char hex)
-    valid, error = validate_sys_id(item_id)
-    if not valid:
-        logger.warning(f"Invalid item_id: {error}")
-        return json.dumps({
-            "success": False,
-            "message": f"Invalid item_id: {error}",
-            "data": None
-        })
-
-    # Validate quantity
-    if quantity < 1:
-        logger.warning(f"Invalid quantity: {quantity}")
-        return json.dumps({
-            "success": False,
-            "message": "Quantity must be at least 1",
-            "data": None
-        })
-
-    # Parse and clean variables JSON
+    # 1. Parsing des variables
     parsed_variables = {}
     if variables:
-        # Clean markdown code block wrappers if present
         cleaned_variables = clean_json_from_markdown(variables)
-
         try:
             parsed_variables = json.loads(cleaned_variables)
-            if not isinstance(parsed_variables, dict):
-                logger.warning("Variables is not a JSON object")
-                return json.dumps({
-                    "success": False,
-                    "message": "Variables must be a JSON object (dictionary), not an array or primitive",
-                    "data": None
-                })
-            logger.debug(f"Parsed {len(parsed_variables)} variables for catalog request")
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse variables JSON: {e}")
-            return json.dumps({
-                "success": False,
-                "message": f"Invalid JSON in variables parameter: {str(e)}. Ensure proper JSON format without trailing commas.",
-                "data": None
-            })
+        except json.JSONDecodeError:
+            return json.dumps({"success": False, "message": "Variables JSON invalide", "data": None})
 
-    # Build the order payload for sn_sc API
+    # 2. Construction du Payload (Respect strict de la doc sn_sc)
+    # L'API attend 'sysparm_quantity' et 'variables' (objet)
     payload = {
         "sysparm_quantity": str(quantity),
         "variables": parsed_variables
     }
 
-    # Direct API call to Service Catalog namespace (sn_sc)
-    # Note: This uses a different API path than the standard Table API
     url = f"https://{SN_INSTANCE}.service-now.com/api/sn_sc/servicecatalog/items/{item_id}/order_now"
 
-    logger.info(f"Calling Service Catalog API: POST {url}")
-
+    # 3. Appel API avec gestion d'erreur détaillée
     try:
-        response = session.post(
-            url,
-            json=payload,
-            timeout=REQUEST_TIMEOUT
-        )
-        response.raise_for_status()
+        response = session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        
+        # Si ça échoue (400, 404, 500), on veut lire le corps de la réponse car il contient la raison
+        if response.status_code != 200:
+            try:
+                error_body = response.json()
+                error_detail = error_body.get('result', {}).get('err_msg') or error_body.get('error', {}).get('message')
+            except:
+                error_detail = response.text[:200]
+                
+            logger.error(f"ServiceNow API Error {response.status_code}: {error_detail}")
+            return json.dumps({
+                "success": False, 
+                "message": f"ServiceNow rejected the request (HTTP {response.status_code}). Reason: {error_detail}",
+                "data": {"raw_error": error_body if 'error_body' in locals() else None}
+            })
+
         result = response.json()
-    except requests.exceptions.Timeout:
-        logger.error(f"Request timeout after {REQUEST_TIMEOUT}s")
-        return json.dumps({
-            "success": False,
-            "message": f"Request timeout after {REQUEST_TIMEOUT} seconds",
-            "data": None
-        })
-    except requests.exceptions.HTTPError as e:
-        error_detail = e.response.text[:500] if e.response else str(e)
-        logger.error(f"HTTP error submitting catalog request: {e.response.status_code} - {error_detail}")
-        return json.dumps({
-            "success": False,
-            "message": f"Failed to submit catalog request: HTTP {e.response.status_code}. Check that item_id is valid and all mandatory variables are provided.",
-            "data": {"error_detail": error_detail}
-        })
-    except requests.RequestException as e:
-        logger.error(f"Request failed: {e}")
-        return json.dumps({
-            "success": False,
-            "message": f"Request failed: {str(e)}",
-            "data": None
-        })
+        
+    except Exception as e:
+        return json.dumps({"success": False, "message": f"Connection failed: {str(e)}", "data": None})
 
-    request_data = result.get("result", {})
-
-    # Extract relevant information from the response
-    request_number = request_data.get("request_number") or request_data.get("number")
-    request_id = request_data.get("request_id") or request_data.get("sys_id")
-
-    logger.info(f"Catalog request submitted successfully: {request_number}")
-
+    # 4. Succès
+    data = result.get("result", {})
     return json.dumps({
         "success": True,
-        "message": f"Catalog request submitted successfully: {request_number}",
-        "data": {
-            "request_number": request_number,
-            "request_id": request_id,
-            "item_id": item_id,
-            "quantity": quantity,
-            "table": request_data.get("table", "sc_request"),
-            "redirect_url": request_data.get("redirect_url")
-        }
+        "message": f"Order created successfully. Request Number: {data.get('number')}",
+        "data": data
     })
 
 
