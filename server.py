@@ -3,6 +3,7 @@ import logging
 import json
 import re
 import requests
+import csv
 from functools import lru_cache
 from typing import Optional
 from datetime import datetime
@@ -140,7 +141,30 @@ INCIDENT_RESOLVER_FIELDS = "sys_id"
 CHANGE_LIST_FIELDS = "number,sys_id,short_description,type,state,risk,impact,start_date,end_date,sys_created_on,sys_updated_on"
 CHANGE_DETAIL_FIELDS = "number,sys_id,short_description,description,type,state,risk,impact,priority,start_date,end_date,assigned_to,assignment_group,sys_created_on,sys_updated_on"
 CHANGE_TASK_FIELDS = "number,short_description,state,assigned_to"
+CHANGE_TASK_FIELDS = "number,short_description,state,assigned_to"
 CHANGE_RESOLVER_FIELDS = "sys_id"
+
+# ========== CACHE FOR BUSINESS SERVICES ==========
+SERVICES_CACHE = []
+
+def load_services_cache():
+    """Load business services from CSV into memory."""
+    global SERVICES_CACHE
+    csv_path = "cmdb_ci_service.csv"
+    if not os.path.exists(csv_path):
+        logger.warning(f"Services CSV not found at {csv_path}. Business service search will be empty.")
+        return
+
+    try:
+        with open(csv_path, mode='r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            SERVICES_CACHE = [row for row in reader]
+        logger.info(f"Loaded {len(SERVICES_CACHE)} business services into cache.")
+    except Exception as e:
+        logger.error(f"Failed to load services CSV: {e}")
+
+# Load cache on module import/startup
+load_services_cache()
 
 # Article list: minimal fields for search results (fetch full text only via get_article)
 ARTICLE_LIST_FIELDS = "number,sys_id,short_description,sys_view_count"
@@ -328,10 +352,8 @@ def clean_json_from_markdown(json_str: str) -> str:
 def make_request(method: str, endpoint: str, data: dict = None, params: dict = None) -> dict:
     """Helper to make ServiceNow API requests."""
     if not SN_INSTANCE or not SN_USER or not SN_PASSWORD:
-        return {
-            "success": False,
-            "message": "Environment variables SN_INSTANCE, SN_USER, and SN_PASSWORD must be set"
-        }
+        logger.error("Missing environment variables for ServiceNow connection")
+        return {"error": "Environment variables SN_INSTANCE, SN_USER, and SN_PASSWORD must be set"}
 
     url = f"https://{SN_INSTANCE}.service-now.com/api/now/{endpoint}"
 
@@ -411,12 +433,52 @@ def resolve_change_id(change_id: str) -> Optional[str]:
 # ========== INCIDENT MANAGEMENT (6 tools) ==========
 
 @mcp.tool()
+def search_business_service(query: str) -> str:
+    """Search for a business service by name (cached locally).
+
+    Args:
+        query: Search term (e.g., "SAP", "Email")
+
+    Returns:
+        JSON string with top 5 matching services
+    """
+    logger.info(f"Searching business services for: {query}")
+    if not query:
+        return json.dumps({"success": False, "message": "Query cannot be empty"})
+
+    if not SERVICES_CACHE:
+        return json.dumps({"success": False, "message": "Service cache is empty or not loaded."})
+
+    query_lower = query.lower()
+    matches = [
+        s for s in SERVICES_CACHE 
+        if query_lower in s.get("name", "").lower()
+    ]
+    
+    # Return top 5
+    top_matches = matches[:5]
+    
+    if not top_matches:
+        return json.dumps({
+            "success": True, 
+            "message": f"No services found for '{query}'", 
+            "data": []
+        })
+
+    return json.dumps({
+        "success": True, 
+        "data": top_matches
+    })
+
+
+@mcp.tool()
 def create_incident(
     short_description: str,
     urgency: int,
     category: str = "Hardware",
     description: str = None,
-    priority: str = None
+    priority: str = None,
+    business_service_id: str = None
 ) -> str:
     """Create a new incident in ServiceNow.
 
@@ -430,6 +492,7 @@ def create_incident(
         category: Category (Hardware, Software, Network, etc.)
         description: Detailed description (optional)
         priority: Priority level (1-5, optional)
+        business_service_id: sys_id of the affected business service (optional)
 
     Returns:
         JSON string with incident details including incident number
@@ -463,6 +526,9 @@ def create_incident(
         payload["description"] = description
     if priority:
         payload["priority"] = priority
+    if business_service_id:
+        payload["business_service"] = business_service_id
+        payload["cmdb_ci"] = business_service_id
 
     # Limit response fields and exclude reference links for faster API response
     result = make_request("POST", "table/incident", data=payload, params={
