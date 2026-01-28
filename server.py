@@ -471,6 +471,26 @@ def search_business_service(query: str) -> str:
     })
 
 
+
+def resolve_business_service_name(name: str) -> Optional[str]:
+    """Helper to resolve business service name to sys_id from cache.
+    
+    Args:
+        name: Business service name to look up
+        
+    Returns:
+        sys_id if found, None otherwise
+    """
+    if not name or not SERVICES_CACHE:
+        return None
+        
+    name_lower = name.lower().strip()
+    for service in SERVICES_CACHE:
+        if service.get("name", "").lower().strip() == name_lower:
+            return service.get("sys_id")
+            
+    return None
+
 @mcp.tool()
 def create_incident(
     short_description: str,
@@ -478,7 +498,8 @@ def create_incident(
     category: str = "Hardware",
     description: str = None,
     priority: str = None,
-    business_service_id: str = None
+    business_service_id: str = None,
+    business_service_name: str = None
 ) -> str:
     """Create a new incident in ServiceNow.
 
@@ -493,6 +514,7 @@ def create_incident(
         description: Detailed description (optional)
         priority: Priority level (1-5, optional)
         business_service_id: sys_id of the affected business service (optional)
+        business_service_name: Exact name of the business service (e.g. "Email", "SAP Enterprise Services") (optional)
 
     Returns:
         JSON string with incident details including incident number
@@ -515,6 +537,20 @@ def create_incident(
             "message": error,
             "data": None
         })
+        
+    # Resolve business service name if provided
+    final_service_id = business_service_id
+    if business_service_name:
+        resolved_id = resolve_business_service_name(business_service_name)
+        if resolved_id:
+            final_service_id = resolved_id
+            logger.info(f"Resolved service name '{business_service_name}' to ID {resolved_id}")
+        else:
+             return json.dumps({
+                "success": False,
+                "message": f"Business service '{business_service_name}' not found. Please verify the exact name.",
+                "data": None
+            })
 
     payload = {
         "short_description": short_description,
@@ -526,9 +562,9 @@ def create_incident(
         payload["description"] = description
     if priority:
         payload["priority"] = priority
-    if business_service_id:
-        payload["business_service"] = business_service_id
-        payload["cmdb_ci"] = business_service_id
+    if final_service_id:
+        payload["business_service"] = final_service_id
+        payload["cmdb_ci"] = final_service_id
 
     # Limit response fields and exclude reference links for faster API response
     result = make_request("POST", "table/incident", data=payload, params={
